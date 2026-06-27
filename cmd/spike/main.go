@@ -1,7 +1,7 @@
 // Command spike proves-or-demotes the prefixfair premise with real measurements.
 //
 // It manages a fleet of real llama-server processes (no simulated latency, no
-// simulated cache) and measures two gates against them:
+// simulated cache) via the worker package and measures two gates against them:
 //
 //	Gate 1 (real-cache-TTFT-above-noise): a repeated long shared prefix (cache
 //	HIT) versus distinct long prefixes (cache MISS) must produce a clean TTFT
@@ -12,41 +12,24 @@
 //	serve concurrently with per-instance TTFT stability under concurrency.
 //
 // Every latency is measured two ways for cross-validation: end-to-end wall-clock
-// TTFT (client stamps the first streamed token) and the server-reported prefill
-// time (timings.prompt_ms) plus the reused-token count (timings.cache_n).
+// TTFT (client stamps the first streamed token, via worker.Complete) and the
+// server-reported prefill time (timings.prompt_ms) plus the reused-token count
+// (timings.cache_n). The server/client/prompt machinery lives in the worker
+// package so the gates share exactly the adapter the router harness uses.
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"math"
-	"net/http"
 	"os"
-	"os/exec"
 	"sort"
-	"strings"
 	"time"
+
+	"prefixfair/internal/worker"
 )
-
-// serverTimings mirrors the llama-server completion "timings" object. Only the
-// fields load-bearing for the cache mechanism are decoded.
-type serverTimings struct {
-	PromptN   int     `json:"prompt_n"`  // prompt tokens actually evaluated (prefill)
-	CacheN    int     `json:"cache_n"`   // prompt tokens reused from the KV cache (skipped)
-	PromptMs  float64 `json:"prompt_ms"` // wall time spent in prefill on the server
-	PredictMs float64 `json:"predicted_ms"`
-}
-
-// trialResult is one measured request.
-type trialResult struct {
-	ttftMs  float64       // end-to-end wall-clock time to first streamed token
-	timings serverTimings // server-reported timings from the final stream chunk
-}
 
 // stats summarizes a sample.
 type stats struct {
@@ -108,156 +91,8 @@ func pooledStd(a, b []float64) float64 {
 	return math.Sqrt((na*sa.std*sa.std + nb*sb.std*sb.std) / (na + nb))
 }
 
-// makePrefix builds a prefix of n sentences. Each sentence embeds a fixed-WIDTH
-// 9-digit id, so the token length is constant regardless of `seed`. That control
-// is the point: seed==0 (the shared HIT prefix) and any seed!=0 (a distinct MISS
-// prefix) tokenize to the SAME length, so the only variable between HIT and MISS
-// is whether the KV cache is reused, not how much text there is to prefill.
-//
-// Distinct seeds diverge from token 0, so no two seeds share a cacheable prefix.
-// The id space (seed*1000 + i) is kept below 1e9 by the caller so the %09d width
-// never overflows and every id stays unique per (seed, sentence).
-func makePrefix(n, seed int) string {
-	var b strings.Builder
-	for i := 0; i < n; i++ {
-		if i > 0 {
-			b.WriteByte(' ')
-		}
-		id := (seed*1000 + i) % 1_000_000_000
-		fmt.Fprintf(&b, "The quick brown fox jumps over the lazy dog number %09d.", id)
-	}
-	return b.String()
-}
-
-// streamTTFT sends a streaming completion and returns the wall-clock TTFT plus
-// the server's final timings. cachePrompt controls whether the server is allowed
-// to reuse KV across requests on the chosen slot.
-func streamTTFT(ctx context.Context, client *http.Client, url, prompt string, cachePrompt bool) (trialResult, error) {
-	reqBody, err := json.Marshal(map[string]any{
-		"prompt":       prompt,
-		"n_predict":    4,
-		"cache_prompt": cachePrompt,
-		"stream":       true,
-		"temperature":  0.0,
-	})
-	if err != nil {
-		return trialResult{}, err
-	}
-	start := time.Now()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url+"/completion", bytes.NewReader(reqBody))
-	if err != nil {
-		return trialResult{}, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
-	if err != nil {
-		return trialResult{}, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return trialResult{}, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-
-	var res trialResult
-	firstStamped := false
-	sc := bufio.NewScanner(resp.Body)
-	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
-	for sc.Scan() {
-		line := sc.Text()
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		payload := strings.TrimPrefix(line, "data: ")
-		var chunk struct {
-			Content string        `json:"content"`
-			Stop    bool          `json:"stop"`
-			Timings serverTimings `json:"timings"`
-		}
-		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
-			continue
-		}
-		if !firstStamped && chunk.Content != "" {
-			res.ttftMs = float64(time.Since(start).Microseconds()) / 1000.0
-			firstStamped = true
-		}
-		if chunk.Stop {
-			res.timings = chunk.Timings
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return trialResult{}, err
-	}
-	if !firstStamped {
-		// No token content ever arrived; treat the whole request as first-token time.
-		res.ttftMs = float64(time.Since(start).Microseconds()) / 1000.0
-	}
-	return res, nil
-}
-
-// llamaServer wraps a spawned process and its base URL.
-type llamaServer struct {
-	cmd  *exec.Cmd
-	url  string
-	port int
-	log  *os.File
-}
-
-// startServer spawns one llama-server. Threads are pinned by the caller so the
-// whole fleet stays within the physical core budget.
-func startServer(modelPath, binPath string, port, slots, ctx, threads int, logDir string) (*llamaServer, error) {
-	logPath := fmt.Sprintf("%s/llama-%d.log", logDir, port)
-	logFile, err := os.Create(logPath)
-	if err != nil {
-		return nil, err
-	}
-	args := []string{
-		"-m", modelPath,
-		"-np", fmt.Sprint(slots),
-		"-c", fmt.Sprint(ctx),
-		"-t", fmt.Sprint(threads),
-		"-tb", fmt.Sprint(threads),
-		"--cache-reuse", "256",
-		"--metrics",
-		"--port", fmt.Sprint(port),
-		"--host", "127.0.0.1",
-	}
-	cmd := exec.Command(binPath, args...)
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-	if err := cmd.Start(); err != nil {
-		logFile.Close()
-		return nil, err
-	}
-	return &llamaServer{cmd: cmd, url: fmt.Sprintf("http://127.0.0.1:%d", port), port: port, log: logFile}, nil
-}
-
-func (s *llamaServer) stop() {
-	if s.cmd != nil && s.cmd.Process != nil {
-		_ = s.cmd.Process.Kill()
-		_, _ = s.cmd.Process.Wait()
-	}
-	if s.log != nil {
-		_ = s.log.Close()
-	}
-}
-
-// waitHealthy polls /health until the server reports ok or the deadline passes.
-func waitHealthy(client *http.Client, url string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		resp, err := client.Get(url + "/health")
-		if err == nil {
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK && strings.Contains(string(body), "ok") {
-				return nil
-			}
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	return fmt.Errorf("server %s not healthy within %s", url, timeout)
-}
+// ms converts a measured duration to milliseconds for reporting.
+func ms(d time.Duration) float64 { return float64(d.Microseconds()) / 1000.0 }
 
 // ---- Gate 1 -------------------------------------------------------------------
 
@@ -265,27 +100,34 @@ func runGate1(cfg config, w io.Writer) (bool, error) {
 	fmt.Fprintf(w, "\n=== GATE 1: real-cache-TTFT-above-noise ===\n")
 	// ctx 16384 with 2 slots gives each slot 8192 tokens, comfortably fitting the
 	// long width-stable prefix (~4.2k tokens) plus suffix and generation.
-	srv, err := startServer(cfg.model, cfg.bin, cfg.basePort, 2, 16384, 6, cfg.logDir)
+	srv, err := worker.Start(worker.Config{
+		Bin:        cfg.bin,
+		Model:      cfg.model,
+		Port:       cfg.basePort,
+		Slots:      2,
+		CtxTotal:   16384,
+		Threads:    6,
+		CacheReuse: 256,
+		LogDir:     cfg.logDir,
+	})
 	if err != nil {
 		return false, err
 	}
-	defer srv.stop()
-	client := &http.Client{Timeout: 120 * time.Second}
-	if err := waitHealthy(client, srv.url, 60*time.Second); err != nil {
+	defer srv.Stop()
+	if err := srv.WaitHealthy(60 * time.Second); err != nil {
 		return false, err
 	}
-	fmt.Fprintf(w, "server up on %s; prefix = %d sentences\n", srv.url, cfg.prefixSentences)
+	fmt.Fprintf(w, "server up on %s; prefix = %d sentences\n", srv.URL(), cfg.prefixSentences)
 
 	ctx := context.Background()
-	sharedPrefix := makePrefix(cfg.prefixSentences, 0)
 
 	// Report the token length of the shared prefix so the finding is concrete.
-	if ntok, err := tokenCount(client, srv.url, sharedPrefix); err == nil {
+	if ntok, err := srv.Tokenize(ctx, worker.WidthStablePrefix(cfg.prefixSentences, 0)); err == nil {
 		fmt.Fprintf(w, "shared prefix token length: %d\n", ntok)
 	}
 
-	// Warmup: prime the slot with the shared prefix, then a MISS warmup. Discarded.
-	if _, err := streamTTFT(ctx, client, srv.url, sharedPrefix+" warmup ask: 1?", true); err != nil {
+	// Warmup: prime the slot with the shared prefix. Discarded.
+	if _, err := srv.Complete(ctx, worker.Request{Prompt: worker.HitPrompt(cfg.prefixSentences, -1), NPredict: 4, CachePrompt: true}); err != nil {
 		return false, err
 	}
 
@@ -296,33 +138,30 @@ func runGate1(cfg config, w io.Writer) (bool, error) {
 	// HIT trials: identical shared prefix, varied short suffix, sent sequentially
 	// so the warm slot keeps the prefix resident and the server skips its prefill.
 	for i := 0; i < cfg.hitTrials; i++ {
-		prompt := fmt.Sprintf("%s Question %d: what is %d plus %d?", sharedPrefix, i, i, i+1)
-		r, err := streamTTFT(ctx, client, srv.url, prompt, true)
+		r, err := srv.Complete(ctx, worker.Request{Prompt: worker.HitPrompt(cfg.prefixSentences, i), NPredict: 4, CachePrompt: true})
 		if err != nil {
 			return false, fmt.Errorf("hit trial %d: %w", i, err)
 		}
-		hitTTFT = append(hitTTFT, r.ttftMs)
-		hitPromptMs = append(hitPromptMs, r.timings.PromptMs)
-		hitCacheReused += r.timings.CacheN
+		hitTTFT = append(hitTTFT, ms(r.TTFT))
+		hitPromptMs = append(hitPromptMs, r.Timings.PromptMs)
+		hitCacheReused += r.Timings.CacheN
 	}
 
 	// MISS trials: a distinct long prefix each time so nothing is reusable.
 	for i := 0; i < cfg.missTrials; i++ {
-		prompt := makePrefix(cfg.prefixSentences, i+1) +
-			fmt.Sprintf(" Question: what is %d plus %d?", i, i+1)
-		r, err := streamTTFT(ctx, client, srv.url, prompt, true)
+		r, err := srv.Complete(ctx, worker.Request{Prompt: worker.MissPrompt(cfg.prefixSentences, i+1), NPredict: 4, CachePrompt: true})
 		if err != nil {
 			return false, fmt.Errorf("miss trial %d: %w", i, err)
 		}
-		missTTFT = append(missTTFT, r.ttftMs)
-		missPromptMs = append(missPromptMs, r.timings.PromptMs)
-		missCacheReused += r.timings.CacheN
+		missTTFT = append(missTTFT, ms(r.TTFT))
+		missPromptMs = append(missPromptMs, r.Timings.PromptMs)
+		missCacheReused += r.Timings.CacheN
 	}
 
-	hs, ms := summarize(hitTTFT), summarize(missTTFT)
+	hs, mstat := summarize(hitTTFT), summarize(missTTFT)
 	hp, mp := summarize(hitPromptMs), summarize(missPromptMs)
 	pooled := pooledStd(hitTTFT, missTTFT)
-	deltaMs := ms.mean - hs.mean
+	deltaMs := mstat.mean - hs.mean
 	ratio := math.Inf(1)
 	if pooled > 0 {
 		ratio = deltaMs / pooled
@@ -330,7 +169,7 @@ func runGate1(cfg config, w io.Writer) (bool, error) {
 
 	fmt.Fprintf(w, "\n-- wall-clock TTFT (end-to-end, streamed first token) --\n")
 	fmt.Fprintf(w, "HIT  %s\n", hs)
-	fmt.Fprintf(w, "MISS %s\n", ms)
+	fmt.Fprintf(w, "MISS %s\n", mstat)
 	fmt.Fprintf(w, "delta(mean) = %.1f ms | pooled std = %.1f ms | ratio = %.1fx\n", deltaMs, pooled, ratio)
 	fmt.Fprintf(w, "\n-- server prefill time (timings.prompt_ms), cross-check --\n")
 	fmt.Fprintf(w, "HIT  %s\n", hp)
@@ -345,76 +184,54 @@ func runGate1(cfg config, w io.Writer) (bool, error) {
 	return pass, nil
 }
 
-func tokenCount(client *http.Client, url, content string) (int, error) {
-	body, _ := json.Marshal(map[string]any{"content": content})
-	resp, err := client.Post(url+"/tokenize", "application/json", bytes.NewReader(body))
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-	var out struct {
-		Tokens []int `json:"tokens"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return 0, err
-	}
-	return len(out.Tokens), nil
-}
-
 // ---- Gate 2 -------------------------------------------------------------------
 
 func runGate2(cfg config, w io.Writer) (bool, error) {
 	fmt.Fprintf(w, "\n=== GATE 2: N-instances-on-the-box (N=%d, %d threads each) ===\n", cfg.fleetN, cfg.threadsPer)
-	if cfg.fleetN*cfg.threadsPer > cfg.cores {
-		return false, fmt.Errorf("thread budget exceeded: %d*%d > %d cores", cfg.fleetN, cfg.threadsPer, cfg.cores)
+	fleet, err := worker.StartFleet(worker.FleetSpec{
+		Bin:        cfg.bin,
+		Model:      cfg.model,
+		BasePort:   cfg.basePort + 10,
+		N:          cfg.fleetN,
+		Slots:      2,
+		CtxTotal:   16384,
+		Threads:    cfg.threadsPer,
+		CacheReuse: 256,
+		LogDir:     cfg.logDir,
+		Cores:      cfg.cores,
+	}, 90*time.Second)
+	if err != nil {
+		return false, err
 	}
-	client := &http.Client{Timeout: 120 * time.Second}
-
-	var fleet []*llamaServer
-	defer func() {
-		for _, s := range fleet {
-			s.stop()
-		}
-	}()
-	for i := 0; i < cfg.fleetN; i++ {
-		port := cfg.basePort + 10 + i
-		srv, err := startServer(cfg.model, cfg.bin, port, 2, 16384, cfg.threadsPer, cfg.logDir)
-		if err != nil {
-			return false, err
-		}
-		fleet = append(fleet, srv)
-	}
-	for _, s := range fleet {
-		if err := waitHealthy(client, s.url, 90*time.Second); err != nil {
-			return false, fmt.Errorf("fleet health: %w", err)
-		}
-	}
-	fmt.Fprintf(w, "all %d instances healthy on ports %d..%d\n", cfg.fleetN, fleet[0].port, fleet[len(fleet)-1].port)
+	defer fleet.Stop()
+	fmt.Fprintf(w, "all %d instances healthy on ports %d..%d\n", cfg.fleetN,
+		fleet.Workers[0].Port(), fleet.Workers[fleet.Len()-1].Port())
 
 	ctx := context.Background()
 
 	// Per-instance load: each request is a distinct, width-stable MISS-style prompt
 	// so every instance does the same real prefill work (the honest, heaviest case)
-	// and TTFT variance reflects CPU contention, not workload drift. The per-tag id
-	// space keeps every prefix unique and below the %09d overflow bound.
-	load := func(srv *llamaServer, reqs int, tag int) []float64 {
+	// and TTFT variance reflects CPU contention, not workload drift.
+	load := func(srv *worker.Worker, reqs, tag int) []float64 {
 		var out []float64
 		for i := 0; i < reqs; i++ {
-			p := makePrefix(cfg.prefixSentences, tag*100_000+i) +
-				fmt.Sprintf(" Q%d: sum of %d and %d?", i, i, i+1)
-			r, err := streamTTFT(ctx, client, srv.url, p, true)
+			r, err := srv.Complete(ctx, worker.Request{
+				Prompt:      worker.MissPrompt(cfg.prefixSentences, tag*100_000+i),
+				NPredict:    4,
+				CachePrompt: true,
+			})
 			if err != nil {
-				fmt.Fprintf(w, "  [port %d req %d] error: %v\n", srv.port, i, err)
+				fmt.Fprintf(w, "  [port %d req %d] error: %v\n", srv.Port(), i, err)
 				continue
 			}
-			out = append(out, r.ttftMs)
+			out = append(out, ms(r.TTFT))
 		}
 		return out
 	}
 
 	// Baseline: one instance alone, no concurrency.
 	fmt.Fprintf(w, "\n-- baseline: single instance, no concurrency --\n")
-	baseline := load(fleet[0], cfg.loadReqs, 0)
+	baseline := load(fleet.Workers[0], cfg.loadReqs, 0)
 	bs := summarize(baseline)
 	fmt.Fprintf(w, "instance[0] %s\n", bs)
 
@@ -425,13 +242,13 @@ func runGate2(cfg config, w io.Writer) (bool, error) {
 		xs  []float64
 	}
 	ch := make(chan res, cfg.fleetN)
-	for idx, srv := range fleet {
-		go func(idx int, srv *llamaServer) {
+	for idx, srv := range fleet.Workers {
+		go func(idx int, srv *worker.Worker) {
 			ch <- res{idx: idx, xs: load(srv, cfg.loadReqs, idx+1)}
 		}(idx, srv)
 	}
 	perInst := make([][]float64, cfg.fleetN)
-	for range fleet {
+	for range fleet.Workers {
 		r := <-ch
 		perInst[r.idx] = r.xs
 	}
