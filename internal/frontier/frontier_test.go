@@ -102,12 +102,12 @@ func TestMeanCI(t *testing.T) {
 func TestSummarizePreservesPolicyOrderAndAveraging(t *testing.T) {
 	results := []SeedResult{
 		{Seed: 1, Policies: []PolicyResult{
-			{Policy: "cache-affinity", HitRate: 0.8, ServiceGap: 100, Backlogged: true},
-			{Policy: "vtc-cache-blind", HitRate: 0.2, ServiceGap: 10, Backlogged: true},
+			{Policy: "cache-affinity", HitRate: 0.8, ServiceGap: 100, Valid: true, Backlogged: true},
+			{Policy: "vtc-cache-blind", HitRate: 0.2, ServiceGap: 10, Valid: true, Backlogged: true},
 		}},
 		{Seed: 2, Policies: []PolicyResult{
-			{Policy: "cache-affinity", HitRate: 0.6, ServiceGap: 200, Backlogged: true},
-			{Policy: "vtc-cache-blind", HitRate: 0.4, ServiceGap: 20, Backlogged: false},
+			{Policy: "cache-affinity", HitRate: 0.6, ServiceGap: 200, Valid: true, Backlogged: true},
+			{Policy: "vtc-cache-blind", HitRate: 0.4, ServiceGap: 20, Valid: true, Backlogged: false},
 		}},
 	}
 	aggs := Summarize(results)
@@ -129,6 +129,51 @@ func TestSummarizePreservesPolicyOrderAndAveraging(t *testing.T) {
 	}
 	if aggs[1].Backlogged {
 		t.Fatal("vtc-cache-blind had a non-backlogged seed; aggregate must reflect it")
+	}
+}
+
+// TestSummarizeExcludesInvalidSeeds is the honesty guard against averaging crashed
+// seeds. A seed whose policy never reached the snapshot (Valid=false, hit=0, gap=0)
+// must be excluded from the mean, not diluted in as a real (0,0) point, and it must
+// be counted in the valid/total tally so the reliability of the row is visible.
+func TestSummarizeExcludesInvalidSeeds(t *testing.T) {
+	results := []SeedResult{
+		{Seed: 1, Policies: []PolicyResult{{Policy: "p", HitRate: 0.9, ServiceGap: 100, NormalizedGap: 2, Completed: 400, Valid: true, Backlogged: true}}},
+		{Seed: 2, Policies: []PolicyResult{{Policy: "p", HitRate: 0.9, ServiceGap: 100, NormalizedGap: 2, Completed: 400, Valid: true, Backlogged: true}}},
+		{Seed: 3, Policies: []PolicyResult{{Policy: "p", HitRate: 0, ServiceGap: 0, NormalizedGap: 0, Completed: 0, Valid: false}}},
+	}
+	aggs := Summarize(results)
+	if len(aggs) != 1 {
+		t.Fatalf("want 1 aggregate, got %d", len(aggs))
+	}
+	a := aggs[0]
+	if a.TotalSeeds != 3 || a.ValidSeeds != 2 {
+		t.Fatalf("seed tally: got valid=%d total=%d, want 2/3", a.ValidSeeds, a.TotalSeeds)
+	}
+	if math.Abs(a.HitRate.Mean-0.9) > 1e-9 {
+		t.Fatalf("hit mean must exclude the crashed seed: got %v, want 0.9", a.HitRate.Mean)
+	}
+	if math.Abs(a.Gap.Mean-100) > 1e-9 {
+		t.Fatalf("gap mean must exclude the crashed seed: got %v, want 100", a.Gap.Mean)
+	}
+}
+
+// TestReliableThreshold pins the rule that decides whether a policy's row can be
+// trusted as a frontier point: enough valid seeds in both absolute and fractional
+// terms. A policy that crashed most of its seeds is unreliable and must not be
+// placed on the frontier.
+func TestReliableThreshold(t *testing.T) {
+	if reliable(8, 20) {
+		t.Fatal("8/20 valid must be unreliable")
+	}
+	if reliable(2, 2) {
+		t.Fatal("2 valid seeds is too few for a confidence interval")
+	}
+	if !reliable(15, 20) {
+		t.Fatal("15/20 = 75% must be reliable")
+	}
+	if !reliable(19, 20) {
+		t.Fatal("19/20 valid must be reliable")
 	}
 }
 
@@ -168,12 +213,12 @@ func TestTTFTStats(t *testing.T) {
 func TestPairedNormGapDiff(t *testing.T) {
 	results := []SeedResult{
 		{Seed: 1, Policies: []PolicyResult{
-			{Policy: "consistent-hash", NormalizedGap: 3.12},
-			{Policy: "vtc-cache-blind", NormalizedGap: 0.08},
+			{Policy: "consistent-hash", NormalizedGap: 3.12, Valid: true},
+			{Policy: "vtc-cache-blind", NormalizedGap: 0.08, Valid: true},
 		}},
 		{Seed: 2, Policies: []PolicyResult{
-			{Policy: "consistent-hash", NormalizedGap: 2.48},
-			{Policy: "vtc-cache-blind", NormalizedGap: 0.08},
+			{Policy: "consistent-hash", NormalizedGap: 2.48, Valid: true},
+			{Policy: "vtc-cache-blind", NormalizedGap: 0.08, Valid: true},
 		}},
 	}
 	// Per-seed diffs: 3.04 and 2.40, mean 2.72.
@@ -186,10 +231,20 @@ func TestPairedNormGapDiff(t *testing.T) {
 	}
 	// A seed missing one policy must be skipped, not panic.
 	results = append(results, SeedResult{Seed: 3, Policies: []PolicyResult{
-		{Policy: "consistent-hash", NormalizedGap: 9},
+		{Policy: "consistent-hash", NormalizedGap: 9, Valid: true},
 	}})
 	if got2 := pairedNormGapDiff(results, "consistent-hash", "vtc-cache-blind"); got2.Mean != got.Mean {
 		t.Fatalf("incomplete seed should be skipped: mean changed %v -> %v", got.Mean, got2.Mean)
+	}
+	// A seed where one policy crashed (Valid=false) must also be skipped: pairing an
+	// invalid (0,0) point would fabricate a difference. Adding such a seed must not
+	// move the paired mean.
+	results = append(results, SeedResult{Seed: 4, Policies: []PolicyResult{
+		{Policy: "consistent-hash", NormalizedGap: 0, Valid: false},
+		{Policy: "vtc-cache-blind", NormalizedGap: 0.08, Valid: true},
+	}})
+	if got3 := pairedNormGapDiff(results, "consistent-hash", "vtc-cache-blind"); math.Abs(got3.Mean-got.Mean) > 1e-9 {
+		t.Fatalf("invalid seed should be skipped: mean changed %v -> %v", got.Mean, got3.Mean)
 	}
 }
 

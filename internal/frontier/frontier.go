@@ -80,6 +80,9 @@ type PolicyResult struct {
 	Completed  int  // successful completions actually measured (K unless the trace ran short)
 	Errors     int  // real (non-cancellation) errors surfaced
 	Backlogged bool // whether every tenant still had pending work at the snapshot
+	Valid      bool // whether the snapshot was reached (Completed >= K); a seed that
+	// never reached K produced no frontier point and must be excluded from the
+	// aggregate rather than averaged in as a spurious (hit=0, gap=0).
 }
 
 // SeedResult is every policy's result on one trace seed.
@@ -327,6 +330,7 @@ func runPolicy(ctx context.Context, f *worker.Fleet, reqs []trace.Request, p rou
 		Errors:     errCount,
 		ServiceGap: gapAtK,
 		Backlogged: allBacklogged(reqs, tenants, okCount, p),
+		Valid:      okCount >= k, // reached the snapshot; otherwise not a frontier point
 	}
 	if okCount > 0 {
 		res.MeanReuse = reuseSum / float64(okCount)

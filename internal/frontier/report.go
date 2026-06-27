@@ -23,24 +23,41 @@ func (s Stat) String() string {
 	return fmt.Sprintf("%.3f +/- %.3f", s.Mean, s.CI)
 }
 
-// Aggregate is one policy's frontier point summarized over all swept seeds, with
-// confidence intervals on the held-out seed set.
+// Aggregate is one policy's frontier point summarized over the seeds where it
+// actually reached the snapshot, with confidence intervals on the held-out seed set.
 type Aggregate struct {
 	Policy     string
-	Seeds      int
+	TotalSeeds int // seeds swept for this policy
+	ValidSeeds int // seeds that reached the snapshot (the ones the stats are over)
 	HitRate    Stat
 	MeanReuse  Stat
 	Gap        Stat
 	NormGap    Stat
-	TTFTp50    time.Duration // mean across seeds
+	TTFTp50    time.Duration // mean across valid seeds
 	TTFTp95    time.Duration
 	TTFTMean   time.Duration
 	Errors     int
-	Backlogged bool // true only if every seed stayed backlogged at the snapshot
+	Backlogged bool // true only if every VALID seed stayed backlogged at the snapshot
 }
 
-// Aggregate reduces per-seed results into one confidence-bounded point per policy,
-// preserving the policy reporting order.
+// Reliable reports whether this policy has enough valid seeds to be trusted as a
+// frontier point. An unreliable policy crashed too many seeds and its surviving
+// average is a survivorship-biased sample, so it is not placed on the frontier.
+func (a Aggregate) Reliable() bool { return reliable(a.ValidSeeds, a.TotalSeeds) }
+
+// reliable is the trust rule for a policy's row: at least three valid seeds (below
+// which a confidence interval is meaningless) AND at least three quarters of the
+// swept seeds valid (below which the surviving sample is too selective to trust,
+// since failures tend to correlate with the hardest trace draws).
+func reliable(valid, total int) bool {
+	return valid >= 3 && valid*4 >= total*3
+}
+
+// Summarize reduces per-seed results into one confidence-bounded point per policy,
+// preserving the policy reporting order. Statistics are computed ONLY over the seeds
+// that reached the snapshot (Valid): a crashed seed produced no frontier point, and
+// averaging its spurious (hit=0, gap=0) in would silently deflate the row. The count
+// of valid versus total seeds is retained so the row's reliability is visible.
 func Summarize(results []SeedResult) []Aggregate {
 	if len(results) == 0 {
 		return nil
@@ -62,8 +79,14 @@ func Summarize(results []SeedResult) []Aggregate {
 		hit, reuse, gap, ng := []float64{}, []float64{}, []float64{}, []float64{}
 		var p50, p95, mean time.Duration
 		errs := 0
+		valid := 0
 		backlogged := true
 		for _, r := range rs {
+			errs += r.Errors // errors are summed over ALL seeds, valid or not
+			if !r.Valid {
+				continue // exclude crashed seeds from every measured statistic
+			}
+			valid++
 			hit = append(hit, r.HitRate)
 			reuse = append(reuse, r.MeanReuse)
 			gap = append(gap, r.ServiceGap)
@@ -71,23 +94,26 @@ func Summarize(results []SeedResult) []Aggregate {
 			p50 += r.TTFTp50
 			p95 += r.TTFTp95
 			mean += r.TTFTMean
-			errs += r.Errors
 			backlogged = backlogged && r.Backlogged
 		}
-		nn := time.Duration(len(rs))
-		out = append(out, Aggregate{
+		agg := Aggregate{
 			Policy:     name,
-			Seeds:      len(rs),
+			TotalSeeds: len(rs),
+			ValidSeeds: valid,
 			HitRate:    meanCI(hit),
 			MeanReuse:  meanCI(reuse),
 			Gap:        meanCI(gap),
 			NormGap:    meanCI(ng),
-			TTFTp50:    p50 / nn,
-			TTFTp95:    p95 / nn,
-			TTFTMean:   mean / nn,
 			Errors:     errs,
-			Backlogged: backlogged,
-		})
+			Backlogged: valid > 0 && backlogged,
+		}
+		if valid > 0 {
+			nn := time.Duration(valid)
+			agg.TTFTp50 = p50 / nn
+			agg.TTFTp95 = p95 / nn
+			agg.TTFTMean = mean / nn
+		}
+		out = append(out, agg)
 	}
 	return out
 }
@@ -158,12 +184,17 @@ func WriteReport(path string, cfg Config, seeds []int64, results []SeedResult) e
 	fmt.Fprintf(&b, "- VTC cost weights: wIn=%.1f, wOut=%.1f\n", cfg.WIn, cfg.WOut)
 	fmt.Fprintf(&b, "- Held-out seeds (%d): %v\n\n", len(seeds), seeds)
 
-	fmt.Fprintf(&b, "## Frontier (mean +/- 95%% CI over %d held-out seeds)\n\n", len(seeds))
-	fmt.Fprintf(&b, "| policy | cache-hit%% | mean reuse | service gap | norm. gap | TTFT p50 | TTFT p95 | errors |\n")
-	fmt.Fprintf(&b, "|---|---|---|---|---|---|---|---|\n")
+	fmt.Fprintf(&b, "## Frontier (mean +/- 95%% CI over the valid held-out seeds)\n\n")
+	fmt.Fprintf(&b, "Statistics are over the seeds that reached the snapshot; the seeds column shows valid/total. A row marked unreliable (fewer than 75%% of seeds valid) is a survivorship-biased sample and is excluded from the frontier shape below.\n\n")
+	fmt.Fprintf(&b, "| policy | seeds | cache-hit%% | mean reuse | service gap | norm. gap | TTFT p50 | TTFT p95 | errors |\n")
+	fmt.Fprintf(&b, "|---|---|---|---|---|---|---|---|---|\n")
 	for _, a := range aggs {
-		fmt.Fprintf(&b, "| %s | %s | %s | %.0f +/- %.0f | %s | %s | %s | %d |\n",
-			a.Policy,
+		seedCell := fmt.Sprintf("%d/%d", a.ValidSeeds, a.TotalSeeds)
+		if !a.Reliable() {
+			seedCell += " (unreliable)"
+		}
+		fmt.Fprintf(&b, "| %s | %s | %s | %s | %.0f +/- %.0f | %s | %s | %s | %d |\n",
+			a.Policy, seedCell,
 			pct(a.HitRate), a.MeanReuse.String(),
 			a.Gap.Mean, a.Gap.CI, a.NormGap.String(),
 			dur(a.TTFTp50), dur(a.TTFTp95), a.Errors)
@@ -189,11 +220,28 @@ func WriteReport(path string, cfg Config, seeds []int64, results []SeedResult) e
 // policies on a seed, so the per-seed difference cancels it and isolates the real
 // separation. No policy is declared a winner.
 func writeShape(b *strings.Builder, aggs []Aggregate, results []SeedResult) {
-	if len(aggs) < 2 {
+	// The frontier corners are chosen ONLY among reliable policies: a policy that
+	// crashed most of its seeds has a survivorship-biased average and cannot anchor a
+	// corner. Unreliable policies are named so their exclusion is explicit.
+	var trusted []Aggregate
+	var dropped []string
+	for _, a := range aggs {
+		if a.Reliable() {
+			trusted = append(trusted, a)
+		} else {
+			dropped = append(dropped, fmt.Sprintf("%s (%d/%d valid)", a.Policy, a.ValidSeeds, a.TotalSeeds))
+		}
+	}
+	if len(dropped) > 0 {
+		fmt.Fprintf(b, "## Frontier shape\n\n")
+		fmt.Fprintf(b, "Excluded from the frontier as unreliable (too few valid seeds; their failures correlate with the hardest trace draws, so the surviving average is biased): %s.\n\n", strings.Join(dropped, ", "))
+	}
+	if len(trusted) < 2 {
+		fmt.Fprintf(b, "Fewer than two policies produced a reliable frontier point on this run; the shape is not stated. Re-run on an uncontended machine so every policy reaches the snapshot on every seed.\n\n")
 		return
 	}
-	fair, cache := aggs[0], aggs[0]
-	for _, a := range aggs {
+	fair, cache := trusted[0], trusted[0]
+	for _, a := range trusted {
 		if a.NormGap.Mean < fair.NormGap.Mean {
 			fair = a
 		}
@@ -202,7 +250,9 @@ func writeShape(b *strings.Builder, aggs []Aggregate, results []SeedResult) {
 		}
 	}
 
-	fmt.Fprintf(b, "## Frontier shape\n\n")
+	if len(dropped) == 0 {
+		fmt.Fprintf(b, "## Frontier shape\n\n")
+	}
 	fmt.Fprintf(b, "The fair corner is **%s** at %.1f%% cache-hit and normalized gap %.3f. ",
 		fair.Policy, fair.HitRate.Mean*100, fair.NormGap.Mean)
 	fmt.Fprintf(b, "The cache corner is **%s** at %.1f%% cache-hit and normalized gap %.3f.\n\n",
@@ -240,11 +290,13 @@ func pairedNormGapDiff(results []SeedResult, a, b string) Stat {
 	return meanCI(diffs)
 }
 
-// normGapOf returns a policy's normalized gap in a seed's result, if present.
+// normGapOf returns a policy's normalized gap in a seed's result, but only if that
+// seed was valid for the policy. A crashed seed has no frontier point, so pairing
+// its (0,0) would fabricate a difference; it is treated as absent.
 func normGapOf(sr SeedResult, policy string) (float64, bool) {
 	for _, pr := range sr.Policies {
 		if pr.Policy == policy {
-			return pr.NormalizedGap, true
+			return pr.NormalizedGap, pr.Valid
 		}
 	}
 	return 0, false
