@@ -1,0 +1,7 @@
+# Build output
+/spike
+/prefixfair
+*.test
+
+# llama-server logs from local runs
+*.log
