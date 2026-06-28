@@ -45,6 +45,10 @@ func TestFrontierRealBackendEndToEnd(t *testing.T) {
 
 	fleetSpec := worker.DefaultFleetSpec()
 	fleetSpec.Bin, fleetSpec.Model, fleetSpec.LogDir, fleetSpec.N = bin, model, t.TempDir(), 2
+	// Disjoint from the worker package's real-server ports (8100, 8120+): `go test
+	// ./...` runs package binaries in parallel, so this fleet must not bind the same
+	// ports as the worker fleet or the two collide and one fails with a refused dial.
+	fleetSpec.BasePort = 8110
 
 	const k = 24
 	cfg := Config{
