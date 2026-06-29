@@ -203,6 +203,7 @@ func WriteReport(path string, cfg Config, seeds []int64, results []SeedResult) e
 
 	writeShape(&b, aggs, results)
 	writeBacklogNote(&b, aggs)
+	writeCaveats(&b, cfg)
 	writeRaw(&b, results)
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -300,6 +301,34 @@ func normGapOf(sr SeedResult, policy string) (float64, bool) {
 		}
 	}
 	return 0, false
+}
+
+// writeCaveats states, parameterized on the actual run config, the regime the
+// frontier was measured in and where its magnitude does and does not generalize.
+// These are the disclosures the finding needs to be honest rather than oversold: the
+// cache-hit axis is capacity-driven, and one policy's cache-hit advantage is an
+// emergent slot-affinity effect that only holds while the active-tenant count is near
+// the total slot count.
+func writeCaveats(b *strings.Builder, cfg Config) {
+	tenants := cfg.Trace.Tenants
+	totalSlots := cfg.Fleet.N * cfg.Fleet.Slots
+
+	fmt.Fprintf(b, "## Regime and caveats\n\n")
+	fmt.Fprintf(b, "This frontier is measured with %d tenants against N=%d x %d slots = %d aggregate llama-server slots, so the working set (%d distinct tenant prefixes) ",
+		tenants, cfg.Fleet.N, cfg.Fleet.Slots, totalSlots, tenants)
+	if tenants <= totalSlots {
+		fmt.Fprintf(b, "fits inside the aggregate KV capacity (%d slots): the cache holds the entire working set, which compresses the cache-hit axis (even a random load balancer keeps the popular prefixes resident everywhere).\n\n", totalSlots)
+	} else {
+		fmt.Fprintf(b, "exceeds the aggregate KV capacity (%d slots): the working set does not fit, so slots thrash and the cache-hit axis is capacity-constrained.\n\n", totalSlots)
+	}
+
+	if tenants == totalSlots {
+		fmt.Fprintf(b, "**Magnitude is regime-specific.** With tenants == total slots, a cache-blind least-loaded placement under round-robin fair admission develops emergent slot-affinity: each tenant cycles back to a slot still holding its warm prefix, so the cache-blind fair policy scores a cache-hit well above what prefix-blindness would otherwise give. This flatters cache-blind admission and makes the reported fair-corner-to-cache-corner cache-hit separation a **lower bound** on the cost of fairness. A tenants != slots regime (working set larger than capacity) breaks the phase-lock and is expected to widen that separation. Read the separation's magnitude as regime-bound, not a policy constant; see the sensitivity control run.\n\n")
+	}
+
+	fmt.Fprintf(b, "cache-affinity's cache-hit is additionally depressed by the small N=%d fleet: with average load near %d per backend the bounded-load cap and hotspot replication fire aggressively, spreading a hot prefix off its single warm slot. That is the genuine DualMap load-bounding trade (a faithful baseline, not a strawman), and its cache-hit would recover on a larger fleet.\n\n", cfg.Fleet.N, cfg.Fleet.Slots)
+
+	fmt.Fprintf(b, "Cache-hit is measured over each policy's own K completions. Round-robin fair admission serves colder tail-tenant requests than FIFO admission does, so the cache-hit samples are not identical across admission disciplines; this handicaps the fair policy (it serves colder requests) rather than flattering it.\n\n")
 }
 
 // writeBacklogNote surfaces whether the snapshot honored the backlogged assumption

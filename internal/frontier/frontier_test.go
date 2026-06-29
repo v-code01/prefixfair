@@ -2,11 +2,13 @@ package frontier
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"time"
 
 	"prefixfair/internal/trace"
 	"prefixfair/internal/vtc"
+	"prefixfair/internal/worker"
 )
 
 // TestFIFOAdmitterPreservesArrivalOrder pins that FIFO admission dispatches in
@@ -174,6 +176,29 @@ func TestReliableThreshold(t *testing.T) {
 	}
 	if !reliable(19, 20) {
 		t.Fatal("19/20 valid must be reliable")
+	}
+}
+
+// TestWriteCaveatsRegimeDisclosure pins that the regime caveat fires the emergent
+// slot-affinity warning exactly when the active-tenant count equals the total slot
+// count (the phase-lock regime), and drops it otherwise. This is the disclosure the
+// headline's generalization depends on.
+func TestWriteCaveatsRegimeDisclosure(t *testing.T) {
+	locked := Config{Trace: trace.Spec{Tenants: 8}, Fleet: worker.FleetSpec{N: 4, Slots: 2}} // 8 == 4*2
+	var b1 strings.Builder
+	writeCaveats(&b1, locked)
+	if !strings.Contains(b1.String(), "lower bound") || !strings.Contains(b1.String(), "emergent slot-affinity") {
+		t.Fatalf("tenants==slots must warn about emergent slot-affinity and a lower-bound separation; got:\n%s", b1.String())
+	}
+
+	broken := Config{Trace: trace.Spec{Tenants: 12}, Fleet: worker.FleetSpec{N: 4, Slots: 2}} // 12 != 8
+	var b2 strings.Builder
+	writeCaveats(&b2, broken)
+	if strings.Contains(b2.String(), "emergent slot-affinity") {
+		t.Fatalf("tenants!=slots must NOT claim the phase-lock warning; got:\n%s", b2.String())
+	}
+	if !strings.Contains(b2.String(), "exceeds the aggregate KV capacity") {
+		t.Fatalf("working set > capacity should be disclosed; got:\n%s", b2.String())
 	}
 }
 
