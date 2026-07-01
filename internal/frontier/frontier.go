@@ -370,6 +370,13 @@ func policyFactories() []policyFactory {
 		{"consistent-hash", func(n int, _ int64, _ Config) router.Router {
 			return router.NewConsistentHash(n, 0)
 		}},
+		// The ambitious, demotable coupling: VTC least-served admission (fairness) on
+		// top of cache-affinity placement (KV reuse). Reported alongside the four
+		// baselines; it earns a dominance claim only with held-out-seed CIs, else it
+		// is read as attempted-and-null.
+		{"fair-cache-affinity", func(n int, _ int64, cfg Config) router.Router {
+			return router.NewFairCacheAffinity(n, cfg.WIn, cfg.WOut)
+		}},
 	}
 }
 

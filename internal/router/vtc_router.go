@@ -49,21 +49,24 @@ func (v *VTCCacheBlind) Name() string { return "vtc-cache-blind" }
 // Order returns the indices of pending requests in the order VTC would dispatch
 // them: least-served tenant first, so service equalizes across tenants. It is a
 // stable simulation of the scheduler over a fixed batch and does not mutate the
-// live accountant, so repeatedly ordering the same batch is idempotent. Ties in
-// counter and in per-batch accrued cost fall back to input order for determinism.
+// live accountant, so repeatedly ordering the same batch is idempotent.
 func (v *VTCCacheBlind) Order(pending []Request) []int {
-	// Work on a local copy of the counters so the live accountant is untouched.
+	return orderLeastServed(v.acct, pending)
+}
+
+// orderLeastServed is VTC's scheduling mechanism, factored out so every policy that
+// schedules fairly (VTCCacheBlind and the coupled FairCacheAffinity) runs the exact
+// same ordering. It returns pending indices least-served-tenant first per the
+// accountant's virtual counters, working on a local copy so the live accountant is
+// untouched (ordering is idempotent). Ties in counter and per-batch accrued cost fall
+// back to input order for determinism.
+func orderLeastServed(acct *vtc.Accountant, pending []Request) []int {
 	local := make(map[string]float64, len(pending))
 	for _, r := range pending {
 		if _, ok := local[r.Tenant]; !ok {
-			local[r.Tenant] = v.acct.Counter(r.Tenant)
+			local[r.Tenant] = acct.Counter(r.Tenant)
 		}
 	}
-
-	// Repeatedly emit the pending request whose tenant currently has the smallest
-	// virtual counter, then advance that tenant's local counter by the request's
-	// cost, mirroring serve-least-then-charge. Iterating candidates in input order
-	// with a strict less-than keeps ties in input order.
 	used := make([]bool, len(pending))
 	order := make([]int, 0, len(pending))
 	for len(order) < len(pending) {
@@ -79,7 +82,7 @@ func (v *VTCCacheBlind) Order(pending []Request) []int {
 		used[best] = true
 		order = append(order, best)
 		r := pending[best]
-		local[r.Tenant] += v.acct.Cost(r.InputTokens, r.OutputTokens)
+		local[r.Tenant] += acct.Cost(r.InputTokens, r.OutputTokens)
 	}
 	return order
 }

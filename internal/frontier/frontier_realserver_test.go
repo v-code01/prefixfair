@@ -73,8 +73,8 @@ func TestFrontierRealBackendEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
-	if len(results) != 1 || len(results[0].Policies) != 4 {
-		t.Fatalf("want 1 seed x 4 policies, got %d seeds", len(results))
+	if len(results) != 1 || len(results[0].Policies) != 5 {
+		t.Fatalf("want 1 seed x 5 policies, got %d seeds x %d policies", len(results), len(results[0].Policies))
 	}
 
 	byName := map[string]PolicyResult{}
@@ -101,20 +101,23 @@ func TestFrontierRealBackendEndToEnd(t *testing.T) {
 		t.Errorf("too many real errors across policies: %d (retry path not holding)", totalErrors)
 	}
 
-	// VTC schedules least-served-first, so by construction it must achieve the
-	// smallest cross-tenant service gap of the four policies. This is the faithful
-	// behavior the whole fairness axis rests on.
-	vtc, ok := byName["vtc-cache-blind"]
-	if !ok {
-		t.Fatal("vtc-cache-blind result missing")
-	}
-	for name, pr := range byName {
-		if name == "vtc-cache-blind" {
-			continue
+	// The two fair-admission policies (VTC least-served scheduling: vtc-cache-blind
+	// and the coupled fair-cache-affinity) must each achieve a smaller cross-tenant
+	// service gap than every FIFO-admission placement policy. That separation is the
+	// fairness axis the whole finding rests on, and it must hold regardless of which
+	// placement the fair scheduler sits on top of.
+	fairPolicies := []string{"vtc-cache-blind", "fair-cache-affinity"}
+	fifoPolicies := []string{"cache-affinity", "jsq-d", "consistent-hash"}
+	for _, fn := range fairPolicies {
+		fair, ok := byName[fn]
+		if !ok {
+			t.Fatalf("%s result missing", fn)
 		}
-		if vtc.ServiceGap > pr.ServiceGap {
-			t.Errorf("VTC gap %.0f exceeds %s gap %.0f; VTC should be the fairest",
-				vtc.ServiceGap, name, pr.ServiceGap)
+		for _, pn := range fifoPolicies {
+			if fifo, ok := byName[pn]; ok && fair.ServiceGap > fifo.ServiceGap {
+				t.Errorf("%s gap %.0f exceeds FIFO %s gap %.0f; fair admission should be fairer",
+					fn, fair.ServiceGap, pn, fifo.ServiceGap)
+			}
 		}
 	}
 }
