@@ -1,5 +1,5 @@
 // Command frontier replays the multi-tenant Zipfian trace against the real N=4
-// llama-server fleet under each of the four routing policies and writes the
+// llama-server fleet under each of the five routing policies and writes the
 // measured cache-hit / cross-tenant service-gap frontier, with confidence intervals
 // over held-out seeds, to a markdown report.
 //
@@ -74,9 +74,10 @@ func main() {
 
 	seeds := trace.HeldOutSeeds(*seedN)
 
+	nPolicies := len(frontier.PolicyNames())
 	fmt.Printf("frontier: %d policies x %d held-out seeds, K=%d completions, N=%d fleet\n",
-		4, len(seeds), cfg.Completions, cfg.Fleet.N)
-	fmt.Printf("frontier: one cold fleet per policy (4 fleet starts total)\n")
+		nPolicies, len(seeds), cfg.Completions, cfg.Fleet.N)
+	fmt.Printf("frontier: one cold fleet per policy (%d fleet starts total)\n", nPolicies)
 
 	start := time.Now()
 	results, err := frontier.RunSweep(context.Background(), cfg, seeds, func() (*worker.Fleet, error) {

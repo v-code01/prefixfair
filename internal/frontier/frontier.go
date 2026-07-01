@@ -1,6 +1,6 @@
 // Package frontier is the real-backend measurement harness: it replays a
 // multi-tenant Zipfian trace against N live llama-server backends under each of the
-// four routing policies and records, per policy, where it lands on the
+// five routing policies and records, per policy, where it lands on the
 // cache-hit / cross-tenant service-gap plane. The output is the Pareto frontier the
 // whole project exists to measure, reported however it falls.
 //
@@ -9,7 +9,7 @@
 //   - Every latency and every cache-reuse number comes from a real server slot via
 //     the worker package. Nothing in the measured path is simulated.
 //
-//   - Routing is single-threaded. The four policies keep mutable state
+//   - Routing is single-threaded. The policies keep mutable state
 //     (cache-affinity's popularity window, JSQ's rng, VTC's counters) that is not
 //     safe for concurrent use, so every Route call and every accountant update
 //     happens on one control goroutine. The concurrency lives in the fleet serving
@@ -353,7 +353,7 @@ type policyFactory struct {
 	build func(n int, seed int64, cfg Config) router.Router
 }
 
-// policyFactories is the fixed set of four policies, in reporting order. Cache-
+// policyFactories is the fixed set of five policies, in reporting order. Cache-
 // affinity takes its documented defaults (never fit to the trace); JSQ's rng is
 // seeded from the trace seed for reproducibility.
 func policyFactories() []policyFactory {
@@ -378,6 +378,17 @@ func policyFactories() []policyFactory {
 			return router.NewFairCacheAffinity(n, cfg.WIn, cfg.WOut)
 		}},
 	}
+}
+
+// PolicyNames returns the policies the sweep runs, in reporting order. It is the one
+// source of truth for how many policies exist, so callers never hardcode the count.
+func PolicyNames() []string {
+	pfs := policyFactories()
+	names := make([]string, len(pfs))
+	for i, pf := range pfs {
+		names[i] = pf.name
+	}
+	return names
 }
 
 // RunSweep replays every seed through every policy and returns one SeedResult per
