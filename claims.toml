@@ -52,13 +52,13 @@ files = ["bench_results/frontier_t12.md"]
 
 [[claim]]
 text = "fair-cache-affinity is statistically tied with vtc-cache-blind at the fair corner; vtc-cache-blind's cache-hit is 92.5% at tenants=8 and 88.1% at tenants=12, with overlapping intervals, so no claim is made that the coupled policy beats it."
-evidence = ["| vtc-cache-blind | 20/20 | 92.5% +/- 0.2"]
-files = ["bench_results/frontier.md"]
+evidence = ["| vtc-cache-blind | 20/20 | 92.5% +/- 0.2", "| vtc-cache-blind | 20/20 | 88.1% +/- 0.1"]
+files = ["bench_results/frontier.md", "bench_results/frontier_t12.md"]
 
 [[claim]]
 text = "As a point estimate without a confidence interval, fair-cache-affinity posts the lowest TTFT p95 of the five policies in both regimes: 538ms at tenants=8 and 656ms at tenants=12."
-evidence = ["538ms"]
-files = ["bench_results/frontier.md"]
+evidence = ["538ms", "656ms"]
+files = ["bench_results/frontier.md", "bench_results/frontier_t12.md"]
 
 [[claim]]
 text = "The tenants=8 TTFT p95 for fair-cache-affinity (538ms) is below every other policy in that regime, whose p95 range from 627ms to 795ms."
