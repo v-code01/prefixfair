@@ -1,0 +1,76 @@
+# Evidence manifest for prefixfair's README.
+#
+# Every headline number in README.md maps to a claim below whose `evidence`
+# substrings are found by grep in the listed backing `files`. The backing files are
+# the two committed real-backend frontier measurements. Measured on Apple M4 Pro,
+# CPU-only, N=4 llama-server fleet on one Qwen2.5-0.5B Q4_K_M GGUF (mmap-shared), 20
+# held-out seeds (>= 900000000), Go 1.26. Service gap is the cross-tenant max-min
+# weighted-token service at a mid-backlog snapshot (VTC's backlogged-client regime).
+
+[[claim]]
+text = "The price of fairness is a resolved knee: at tenants=8 (KV capacity == working set) moving from the fair corner to the cache corner trades +4.4 cache-hit points for a paired normalized service-gap increase of 2.925, 95% CI 0.082, over the held-out seeds."
+evidence = ["+4.4 cache-hit points for a paired normalized-gap increase of 2.925 (95% CI 0.082)"]
+files = ["bench_results/frontier.md"]
+
+[[claim]]
+text = "At tenants=12 (working set larger than KV capacity) the knee widens to +7.0 cache-hit points for a paired gap increase of 4.066, 95% CI 0.121: the cost of fairness is regime-bound and the tenants=8 number is a lower bound."
+evidence = ["+7.0 cache-hit points for a paired normalized-gap increase of 4.066 (95% CI 0.121)"]
+files = ["bench_results/frontier_t12.md"]
+
+[[claim]]
+text = "At tenants=8 the fair corner is fair-cache-affinity (92.1% cache-hit, normalized gap 0.005) and the cache corner is consistent-hash (96.5% cache-hit, normalized gap 2.930)."
+evidence = [
+  "fair corner is **fair-cache-affinity** at 92.1% cache-hit and normalized gap 0.005",
+  "cache corner is **consistent-hash** at 96.5% cache-hit and normalized gap 2.930",
+]
+files = ["bench_results/frontier.md"]
+
+[[claim]]
+text = "At tenants=12 the fair corner is fair-cache-affinity (88.4% cache-hit, gap 0.030) and the cache corner is consistent-hash (95.3%, gap 4.096)."
+evidence = [
+  "fair corner is **fair-cache-affinity** at 88.4% cache-hit and normalized gap 0.030",
+  "cache corner is **consistent-hash** at 95.3% cache-hit and normalized gap 4.096",
+]
+files = ["bench_results/frontier_t12.md"]
+
+[[claim]]
+text = "The coupled policy fair-cache-affinity Pareto-dominates cache-affinity on both axes at tenants=8: 92.1% vs 88.8% cache-hit, and normalized gap 0.005 vs 2.957, all with 20/20 valid held-out seeds."
+evidence = [
+  "| fair-cache-affinity | 20/20 | 92.1% +/- 0.3 | 0.914 +/- 0.003 | 328 +/- 397 | 0.005 +/- 0.006",
+  "| cache-affinity | 20/20 | 88.8% +/- 0.3 | 0.882 +/- 0.003 | 210201 +/- 5806 | 2.957 +/- 0.082",
+]
+files = ["bench_results/frontier.md"]
+
+[[claim]]
+text = "The dominance holds in the harder tenants=12 regime too: fair-cache-affinity 88.4% cache-hit and gap 0.030 vs cache-affinity 87.1% and 4.132, and vs jsq-d 84.8% and 4.129."
+evidence = [
+  "| fair-cache-affinity | 20/20 | 88.4% +/- 0.2 | 0.877 +/- 0.002 | 1424 +/- 3 | 0.030 +/- 0.000",
+  "| cache-affinity | 20/20 | 87.1% +/- 0.3 | 0.865 +/- 0.003 | 195842 +/- 5413 | 4.132 +/- 0.114",
+  "| jsq-d | 20/20 | 84.8% +/- 0.2 | 0.842 +/- 0.002 | 195700 +/- 5458 | 4.129 +/- 0.115",
+]
+files = ["bench_results/frontier_t12.md"]
+
+[[claim]]
+text = "fair-cache-affinity is statistically tied with vtc-cache-blind at the fair corner; vtc-cache-blind's cache-hit is 92.5% at tenants=8 and 88.1% at tenants=12, with overlapping intervals, so no claim is made that the coupled policy beats it."
+evidence = ["| vtc-cache-blind | 20/20 | 92.5% +/- 0.2"]
+files = ["bench_results/frontier.md"]
+
+[[claim]]
+text = "As a point estimate without a confidence interval, fair-cache-affinity posts the lowest TTFT p95 of the five policies in both regimes: 538ms at tenants=8 and 656ms at tenants=12."
+evidence = ["538ms"]
+files = ["bench_results/frontier.md"]
+
+[[claim]]
+text = "The tenants=8 TTFT p95 for fair-cache-affinity (538ms) is below every other policy in that regime, whose p95 range from 627ms to 795ms."
+evidence = ["| consistent-hash | 20/20 | 96.5% +/- 0.2 | 0.958 +/- 0.002 | 208282 +/- 5918 | 2.930 +/- 0.083 | 383ms | 795ms |"]
+files = ["bench_results/frontier.md"]
+
+[[claim]]
+text = "All five policies reached the snapshot on all 20 held-out seeds in both regimes (20/20 valid), so no row is a survivorship-biased sample and the frontier shape is drawn only from reliable points."
+evidence = ["| fair-cache-affinity | 20/20 |"]
+files = ["bench_results/frontier.md", "bench_results/frontier_t12.md"]
+
+[[claim]]
+text = "The cache-hit axis is capacity-driven and the tenants=8 fair-to-cache cache cost is a lower bound: when tenants equals the total slot count a cache-blind fair scheduler gains emergent slot-affinity, disclosed in the report's regime caveats."
+evidence = ["Magnitude is regime-specific", "emergent slot-affinity"]
+files = ["bench_results/frontier.md"]
