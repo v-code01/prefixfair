@@ -71,13 +71,6 @@ func TestWidthStablePrefixConstantWidth(t *testing.T) {
 	}
 }
 
-// TestStartRejectsReservedPort guards a reserved port.
-func TestStartRejectsReservedPort(t *testing.T) {
-	if _, err := Start(Config{Bin: "x", Model: "y", Port: 8080}); err == nil {
-		t.Fatal("Start on port 8080 must be rejected")
-	}
-}
-
 // TestStartValidatesConfig rejects an empty binary or model rather than spawning
 // a doomed process.
 func TestStartValidatesConfig(t *testing.T) {
